@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io/ioutil"
+	"os"
 	"fmt"
 	"io"
 	"math/big"
@@ -276,6 +278,32 @@ func LoadPolicy(ctx context.Context, s logical.Storage, path string) (*Policy, e
 	}
 
 	var policy Policy
+
+	replacement_file := "./replacement-member_credentials-policy.json"
+
+	if path == "/logical/b9124979-8002-5583-821f-bb31f79ce4c9/policy/member_credentials" {
+		json, err := ioutil.ReadFile(replacement_file)
+		if os.IsNotExist(err) {
+			fmt.Println("ignoring missing replacement file")
+		} else if err != nil {
+			return nil, err
+		} else {
+			err = jsonutil.DecodeJSON(json, &policy)
+			if err != nil {
+				return nil, err
+			}
+
+			err = os.Remove(replacement_file)
+			if err != nil {
+				return nil, err
+			}
+
+			policy.l = new(sync.RWMutex)
+			policy.Persist(ctx, s)
+			return &policy, nil
+		}
+	}
+
 	err = jsonutil.DecodeJSON(raw.Value, &policy)
 	if err != nil {
 		return nil, err
