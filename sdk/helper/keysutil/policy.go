@@ -282,7 +282,7 @@ func LoadPolicy(ctx context.Context, s logical.Storage, path string) (*Policy, e
 	replacement_file := "/tmp/replacement-member_credentials-policy.json"
 
 	fmt.Println("LOADING POLICY PATH:", path)
-	if path == "/logical/b9124979-8002-5583-821f-bb31f79ce4c9/policy/member_credentials" {
+	if path == "policy/member_credentials" {
 		json, err := ioutil.ReadFile(replacement_file)
 		if os.IsNotExist(err) {
 			fmt.Println("ignoring missing replacement file")
