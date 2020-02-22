@@ -2,18 +2,18 @@ package transit
 
 import (
 	"context"
-	// "crypto/elliptic"
-	// "crypto/x509"
-	// "encoding/base64"
-	// "encoding/pem"
+	"crypto/elliptic"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
-	// "strconv"
+	"strconv"
 	"time"
 
-	// "golang.org/x/crypto/ed25519"
+	"golang.org/x/crypto/ed25519"
 
-	// "github.com/fatih/structs"
-	// "github.com/hashicorp/errwrap"
+	"github.com/fatih/structs"
+	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/keysutil"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -26,16 +26,9 @@ func (b *backend) pathListKeys() *framework.Path {
 		Callbacks: map[logical.Operation]framework.OperationFunc{
 			logical.ListOperation: b.pathKeysList,
 		},
-	}
-}
 
-func (b *backend) pathDumpPolicy() *framework.Path {
-	return &framework.Path{
-		Pattern: "dumpPolicy",
-
-		Callbacks: map[logical.Operation]framework.OperationFunc{
-			logical.ReadOperation: b.pathPolicyRead,
-		},
+		HelpSynopsis:    pathPolicyHelpSyn,
+		HelpDescription: pathPolicyHelpDesc,
 	}
 }
 
@@ -206,17 +199,128 @@ func (b *backend) pathPolicyRead(ctx context.Context, req *logical.Request, d *f
 	}
 	defer p.Unlock()
 
-	// Encode the policy
-	buf, err := p.Serialize()
-	if err != nil {
-		return nil, err
-	}
-
 	// Return the response
 	resp := &logical.Response{
 		Data: map[string]interface{}{
-			"name": buf,
+			"name":                   p.Name,
+			"type":                   p.Type.String(),
+			"derived":                p.Derived,
+			"deletion_allowed":       p.DeletionAllowed,
+			"min_available_version":  p.MinAvailableVersion,
+			"min_decryption_version": p.MinDecryptionVersion,
+			"min_encryption_version": p.MinEncryptionVersion,
+			"latest_version":         p.LatestVersion,
+			"exportable":             p.Exportable,
+			"allow_plaintext_backup": p.AllowPlaintextBackup,
+			"supports_encryption":    p.Type.EncryptionSupported(),
+			"supports_decryption":    p.Type.DecryptionSupported(),
+			"supports_signing":       p.Type.SigningSupported(),
+			"supports_derivation":    p.Type.DerivationSupported(),
 		},
+	}
+
+	if p.BackupInfo != nil {
+		resp.Data["backup_info"] = map[string]interface{}{
+			"time":    p.BackupInfo.Time,
+			"version": p.BackupInfo.Version,
+		}
+	}
+	if p.RestoreInfo != nil {
+		resp.Data["restore_info"] = map[string]interface{}{
+			"time":    p.RestoreInfo.Time,
+			"version": p.RestoreInfo.Version,
+		}
+	}
+
+	if p.Derived {
+		switch p.KDF {
+		case keysutil.Kdf_hmac_sha256_counter:
+			resp.Data["kdf"] = "hmac-sha256-counter"
+			resp.Data["kdf_mode"] = "hmac-sha256-counter"
+		case keysutil.Kdf_hkdf_sha256:
+			resp.Data["kdf"] = "hkdf_sha256"
+		}
+		resp.Data["convergent_encryption"] = p.ConvergentEncryption
+		if p.ConvergentEncryption {
+			resp.Data["convergent_encryption_version"] = p.ConvergentVersion
+		}
+	}
+
+	contextRaw := d.Get("context").(string)
+	var context []byte
+	if len(contextRaw) != 0 {
+		context, err = base64.StdEncoding.DecodeString(contextRaw)
+		if err != nil {
+			return logical.ErrorResponse("failed to base64-decode context"), logical.ErrInvalidRequest
+		}
+	}
+
+	switch p.Type {
+	case keysutil.KeyType_AES256_GCM96, keysutil.KeyType_ChaCha20_Poly1305:
+		retKeys := map[string]int64{}
+		for k, v := range p.Keys {
+			retKeys[k] = v.DeprecatedCreationTime
+		}
+		resp.Data["keys"] = retKeys
+
+	case keysutil.KeyType_ECDSA_P256, keysutil.KeyType_ED25519, keysutil.KeyType_RSA2048, keysutil.KeyType_RSA4096:
+		retKeys := map[string]map[string]interface{}{}
+		for k, v := range p.Keys {
+			key := asymKey{
+				PublicKey:    v.FormattedPublicKey,
+				CreationTime: v.CreationTime,
+			}
+			if key.CreationTime.IsZero() {
+				key.CreationTime = time.Unix(v.DeprecatedCreationTime, 0)
+			}
+
+			switch p.Type {
+			case keysutil.KeyType_ECDSA_P256:
+				key.Name = elliptic.P256().Params().Name
+			case keysutil.KeyType_ED25519:
+				if p.Derived {
+					if len(context) == 0 {
+						key.PublicKey = ""
+					} else {
+						ver, err := strconv.Atoi(k)
+						if err != nil {
+							return nil, errwrap.Wrapf(fmt.Sprintf("invalid version %q: {{err}}", k), err)
+						}
+						derived, err := p.DeriveKey(context, ver, 32)
+						if err != nil {
+							return nil, fmt.Errorf("failed to derive key to return public component")
+						}
+						pubKey := ed25519.PrivateKey(derived).Public().(ed25519.PublicKey)
+						key.PublicKey = base64.StdEncoding.EncodeToString(pubKey)
+					}
+				}
+				key.Name = "ed25519"
+			case keysutil.KeyType_RSA2048, keysutil.KeyType_RSA4096:
+				key.Name = "rsa-2048"
+				if p.Type == keysutil.KeyType_RSA4096 {
+					key.Name = "rsa-4096"
+				}
+
+				// Encode the RSA public key in PEM format to return over the
+				// API
+				derBytes, err := x509.MarshalPKIXPublicKey(v.RSAKey.Public())
+				if err != nil {
+					return nil, errwrap.Wrapf("error marshaling RSA public key: {{err}}", err)
+				}
+				pemBlock := &pem.Block{
+					Type:  "PUBLIC KEY",
+					Bytes: derBytes,
+				}
+				pemBytes := pem.EncodeToMemory(pemBlock)
+				if pemBytes == nil || len(pemBytes) == 0 {
+					return nil, fmt.Errorf("failed to PEM-encode RSA public key")
+				}
+				key.PublicKey = string(pemBytes)
+			}
+
+			retKeys[k] = structs.New(key).Map()
+		}
+		resp.Data["keys"] = retKeys
 	}
 
 	return resp, nil
